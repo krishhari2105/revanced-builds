@@ -53,10 +53,17 @@ def error(msg):
     print(f"[!] {msg}", flush=True)
     raise Exception(msg)
 
+def get_auth_headers():
+    token = os.environ.get("PRIVATE_REPO_TOKEN")
+    if token:
+        return {"Authorization": f"token {token}", "User-Agent": "Mozilla/5.0"}
+    return {"User-Agent": "Mozilla/5.0"} # Fallback for public
+
 def download_file(url, filename):
     log(f"Downloading {url} -> {filename}")
     try:
-        with requests.get(url, stream=True) as r:
+        headers = get_auth_headers()
+        with requests.get(url, stream=True, headers=headers) as r:
             if r.status_code == 404: return False
             r.raise_for_status()
             with open(filename, 'wb') as f:
@@ -67,10 +74,12 @@ def download_file(url, filename):
         log(f"Download failed: {e}")
         return False
 
+
+
 def get_latest_github_release(repo):
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
-        resp = requests.get(url).json()
+        resp = requests.get(url, headers=get_auth_headers())
         return resp
     except Exception as e:
         log(f"Failed to fetch release for {repo}: {e}")
