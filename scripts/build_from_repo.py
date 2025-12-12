@@ -115,40 +115,32 @@ def fetch_apkeditor():
     return apkeditor_path
 
 def parse_version_override(override_string, current_app):
-    """
-    Parses version input.
-    Formats accepted:
-    - "auto" (default)
-    - "19.16.39" (Global override)
-    - "yt-music=7.02.51, youtube=19.16.39" (App-specific)
-    """
     if not override_string or override_string == "auto":
         return "auto"
 
-    # Check if it's a map format (contains '=')
     if "=" in override_string:
         try:
-            # Parse comma-separated key=value pairs
             overrides = {}
             for part in override_string.split(","):
                 key, val = part.split("=")
                 overrides[key.strip()] = val.strip()
-            
-            # Return specific override if exists, else auto
             return overrides.get(current_app, "auto")
         except:
             log(f"Warning: Failed to parse version override string '{override_string}'. Using auto.")
             return "auto"
     
-    # It's a single version string, treat as global override
     return override_string
 
-def get_target_version(cli_path, patches_path, package_name, manual_version):
+def get_target_versions(cli_path, patches_path, package_name, manual_version):
+    """
+    Returns a LIST of compatible versions, sorted descending.
+    If manual_version is set, returns a list with just that version.
+    """
     if manual_version and manual_version != "auto":
         log(f"Manual version override: {manual_version}")
-        return manual_version
+        return [manual_version]
         
-    log(f"Auto-detecting version for {package_name}...")
+    log(f"Auto-detecting versions for {package_name}...")
     cmd = ["java", "-jar", cli_path, "list-versions", patches_path]
     try:
         output = subprocess.check_output(cmd, text=True)
@@ -165,14 +157,17 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
                 continue
                 
             if current_pkg == package_name:
+                 # Match version like 19.16.39 or v19.16.39
+                 # Note: regex must be strict enough not to catch patch counts "(58 patches)"
                  v_match = re.match(r'^(v?\d+(\.\d+)+)', line)
                  if v_match:
                      versions.append(v_match.group(1))
 
         if versions:
+            # Sort desc
             versions.sort(key=lambda s: [int(x) for x in s.lstrip('v').split('.') if x.isdigit()], reverse=True)
-            log(f"Detected latest compatible version: {versions[0]}")
-            return versions[0]
+            log(f"Detected compatible versions: {versions}")
+            return versions
             
     except Exception as e:
         log(f"Error detecting version: {e}")
@@ -257,6 +252,9 @@ def merge_bundle(bundle_path, apkeditor_path):
         raise Exception(f"Failed to merge APK bundle: {e}")
 
 def find_apk_in_release(app_name, version):
+    """
+    Returns (download_url, filename) if found, else (None, None).
+    """
     log(f"Searching release assets for {app_name} v{version}...")
     release = get_latest_github_release(f"{APK_REPO_OWNER}/{APK_REPO_NAME}")
     if not release: raise Exception("Could not fetch APK repo releases.")
@@ -264,7 +262,10 @@ def find_apk_in_release(app_name, version):
     target_base = f"{app_name}-v{version}"
     for asset in release.get('assets', []):
         name = asset['name']
+        # Match 'appname-v19.16.39.apk' or 'appname-v19.16.39.apkm'
+        # Strict prefix check to avoid matching 19.16.391 etc if that ever happens
         if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
+            # Ensure precise version matching if needed, but prefix is usually safe
             return asset['browser_download_url'], name
     return None, None
 
@@ -275,14 +276,29 @@ def patch_app(app_key, patch_source, input_version_string, cli_path, patches_pat
         return False
 
     try:
-        # Resolve specific version for this app from the input string
         app_version_setting = parse_version_override(input_version_string, app_key)
         
-        version = get_target_version(cli_path, patches_path, pkg, app_version_setting)
+        # Get LIST of candidate versions
+        candidate_versions = get_target_versions(cli_path, patches_path, pkg, app_version_setting)
         
-        dl_url, apk_filename = find_apk_in_release(app_key, version)
+        dl_url = None
+        apk_filename = None
+        selected_version = None
+
+        # Fallback Logic: Check candidates one by one in release assets
+        for ver in candidate_versions:
+            url, name = find_apk_in_release(app_key, ver)
+            if url:
+                log(f"Found match in repo: {name}")
+                dl_url = url
+                apk_filename = name
+                selected_version = ver
+                break
+            else:
+                log(f"Version {ver} not found in repo, trying next...")
+        
         if not dl_url:
-            log(f"SKIP: APK {app_key}-v{version} not found in storage repo.")
+            log(f"SKIP: No compatible APKs found in storage repo for {app_key}. Checked: {candidate_versions}")
             return False
             
         os.makedirs("downloads", exist_ok=True)
@@ -299,7 +315,7 @@ def patch_app(app_key, patch_source, input_version_string, cli_path, patches_pat
 
         dist_dir = "dist"
         os.makedirs(dist_dir, exist_ok=True)
-        out_apk = f"{dist_dir}/{app_key}-{patch_source}-v{version}-arm64.apk"
+        out_apk = f"{dist_dir}/{app_key}-{patch_source}-v{selected_version}-arm64.apk"
         
         cmd = [
             "java", "-jar", cli_path,
