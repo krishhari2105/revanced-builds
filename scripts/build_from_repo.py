@@ -80,7 +80,8 @@ def get_latest_github_release(repo):
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         resp = requests.get(url, headers=get_auth_headers())
-        return resp
+        resp.raise_for_status()  # Check for HTTP errors (404, 500, etc.)
+        return resp.json()       # <--- RETURN THE JSON DICTIONARY
     except Exception as e:
         log(f"Failed to fetch release for {repo}: {e}")
         return None
