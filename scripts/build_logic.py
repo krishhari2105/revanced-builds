@@ -1,20 +1,43 @@
 import os
-import sys
-import json
 import requests
 import re
-import zipfile
-import shutil
 import subprocess
-import time
-from bs4 import BeautifulSoup
+import sys
 
 # --- Configuration ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Upgrade-Insecure-Requests": "1"
+APK_REPO_OWNER = "krishhari2105"
+APK_REPO_NAME = "base-apks"
+# Raw URL format: https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}
+APK_BASE_URL = f"https://raw.githubusercontent.com/{APK_REPO_OWNER}/{APK_REPO_NAME}/main/apps"
+
+SOURCES = {
+    "revanced": {
+        "patches_repo": "ReVanced/revanced-patches",
+        "cli_repo": "ReVanced/revanced-cli",
+        "patches_asset": ".rvp",
+        "cli_asset": ".jar"
+    },
+    "inotia00": {
+        "patches_repo": "inotia00/revanced-patches",
+        "cli_repo": "inotia00/revanced-cli",
+        "patches_asset": ".rvp",
+        "cli_asset": ".jar"
+    },
+    "anddea": {
+        "patches_repo": "anddea/revanced-patches",
+        "cli_repo": "inotia00/revanced-cli", 
+        "patches_asset": ".rvp",
+        "cli_asset": ".jar"
+    }
+}
+
+# Mapping common names to package names for version checking
+PKG_MAP = {
+    "youtube": "com.google.android.youtube",
+    "yt-music": "com.google.android.apps.youtube.music",
+    "reddit": "com.reddit.frontpage",
+    "twitter": "com.twitter.android",
+    "spotify": "com.spotify.music"
 }
 
 def log(msg):
@@ -26,295 +49,122 @@ def error(msg):
 
 def download_file(url, filename):
     log(f"Downloading {url} -> {filename}")
-    try:
-        with requests.get(url, stream=True, headers=HEADERS) as r:
-            r.raise_for_status()
-            with open(filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        return filename
-    except Exception as e:
-        error(f"Download failed: {e}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # If repo is private, we'd need: headers["Authorization"] = f"token {os.environ['GITHUB_TOKEN']}"
+    
+    with requests.get(url, stream=True, headers=headers) as r:
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        with open(filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return True
 
-def get_latest_github_release(repo):
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
-    try:
-        resp = requests.get(url, headers=HEADERS).json()
-        return resp
-    except Exception as e:
-        error(f"Failed to fetch release for {repo}: {e}")
-
-def fetch_tools():
-    """Downloads CLI, Patches, and APKEditor (for merging splits)."""
+def fetch_tools(source_key):
+    config = SOURCES.get(source_key)
+    if not config: error(f"Invalid source: {source_key}")
+    
     os.makedirs("tools", exist_ok=True)
     
-    # 1. Fetch ReVanced CLI
-    cli_release = get_latest_github_release("ReVanced/revanced-cli")
-    cli_asset = next(a for a in cli_release['assets'] if a['name'].endswith('.jar'))
-    cli_path = f"tools/{cli_asset['name']}"
-    if not os.path.exists(cli_path):
-        download_file(cli_asset['browser_download_url'], cli_path)
+    # Helper to get asset URL
+    def get_asset_url(repo, ext):
+        api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        resp = requests.get(api_url).json()
+        for asset in resp['assets']:
+            if asset['name'].endswith(ext) and "source" not in asset['name']:
+                 if ext == ".jar" and "all" not in asset['name'] and any("all" in a['name'] for a in resp['assets']):
+                    continue
+                 return asset['browser_download_url'], asset['name']
+        return None, None
+
+    # Download CLI
+    cli_url, cli_name = get_asset_url(config['cli_repo'], config['cli_asset'])
+    cli_path = f"tools/{cli_name}"
+    download_file(cli_url, cli_path)
     
-    # 2. Fetch ReVanced Patches (RVP)
-    patches_release = get_latest_github_release("ReVanced/revanced-patches")
-    patches_rvp_asset = next(a for a in patches_release['assets'] if a['name'].endswith('.rvp'))
-    patches_rvp_path = f"tools/{patches_rvp_asset['name']}"
-    if not os.path.exists(patches_rvp_path):
-        download_file(patches_rvp_asset['browser_download_url'], patches_rvp_path)
+    # Download Patches
+    patches_url, patches_name = get_asset_url(config['patches_repo'], config['patches_asset'])
+    patches_path = f"tools/{patches_name}"
+    download_file(patches_url, patches_path)
+    
+    return cli_path, patches_path
 
-    # 3. Fetch APKEditor (Required for merging split APKs)
-    # Using a reliable release from REAndroid (author of APKEditor)
-    apkeditor_path = "tools/APKEditor.jar"
-    if not os.path.exists(apkeditor_path):
-        apkeditor_url = "https://github.com/REAndroid/APKEditor/releases/download/V1.4.0/APKEditor-1.4.0.jar"
-        download_file(apkeditor_url, apkeditor_path)
-        
-    return cli_path, patches_rvp_path, apkeditor_path
-
-def get_compatible_version(package_name, cli_path, patches_rvp_path, manual_version=None):
+def get_target_version(cli_path, patches_path, package_name, manual_version):
     if manual_version and manual_version != "auto":
         log(f"Manual version override: {manual_version}")
         return manual_version
-
-    log(f"Finding compatible version for {package_name} using CLI...")
-    cmd = [
-        "java", "-jar", cli_path, 
-        "list-patches", 
-        "--with-packages", "--with-versions", 
-        patches_rvp_path
-    ]
-    
+        
+    log(f"Auto-detecting version for {package_name}...")
+    cmd = ["java", "-jar", cli_path, "list-patches", "--with-packages", "--with-versions", patches_path]
     try:
-        result = subprocess.check_output(cmd, text=True)
-    except subprocess.CalledProcessError as e:
-        error(f"Failed to list patches: {e}")
-        return None
-
-    versions = set()
-    for line in result.splitlines():
-        if package_name in line:
-            matches = re.findall(r'\(([\d\.,\s\w]+)\)', line)
-            for match in matches:
-                raw_vs = re.split(r'[,\s]+', match)
-                for v in raw_vs:
-                    v = v.strip()
-                    if re.match(r'^\d+(\.\d+)+$', v):
-                        versions.add(v)
-
-    if not versions:
-        log(f"No specific compatible versions found. Using 'latest' fallback.")
-        return "latest"
-
-    def version_key(v):
-        try:
-            return [int(x) for x in v.split('.')]
-        except:
-            return [0]
-    
-    sorted_versions = sorted(list(versions), key=version_key, reverse=True)
-    best_version = sorted_versions[0]
-    log(f"Latest compatible version found: {best_version}")
-    return best_version
-
-# --- Scraper ---
-
-def get_soup(url):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.status_code == 403:
-            log("Hit 403 on APKMirror. Waiting 5s...")
-            time.sleep(5)
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        return BeautifulSoup(resp.text, 'html.parser')
+        output = subprocess.check_output(cmd, text=True)
+        versions = set()
+        for line in output.splitlines():
+            if package_name in line:
+                matches = re.findall(r'\(([\d\.,\s\w]+)\)', line)
+                for match in matches:
+                    raw_vs = re.split(r'[,\s]+', match)
+                    for v in raw_vs:
+                        if re.match(r'^\d+(\.\d+)+$', v.strip()):
+                            versions.add(v.strip())
+        
+        if versions:
+            sorted_vs = sorted(list(versions), key=lambda x: [int(i) for i in x.split('.') if i.isdigit()], reverse=True)
+            log(f"Detected latest compatible version: {sorted_vs[0]}")
+            return sorted_vs[0]
+            
     except Exception as e:
-        log(f"Error fetching {url}: {e}")
-        return None
-
-def scrape_apkmirror(app_name, version):
-    base_url = "https://www.apkmirror.com"
-    query = f"{app_name} {version}" if version != "latest" else app_name
-    search_url = f"{base_url}/?post_type=app_release&searchtype=apk&s={query.replace(' ', '+')}"
-    
-    log(f"Searching APKMirror: {search_url}")
-    soup = get_soup(search_url)
-    if not soup: return None
-    
-    release_url = None
-    rows = soup.find_all("div", class_="appRow")
-    
-    for row in rows:
-        title_div = row.find("h5", class_="appRowTitle")
-        if not title_div: continue
-        title_text = title_div.get_text().strip()
-        link = title_div.find("a")['href']
+        log(f"Error detecting version: {e}")
         
-        if version == "latest":
-            release_url = base_url + link
-            log(f"Selected latest release: {title_text}")
-            break
-        elif version in title_text:
-            release_url = base_url + link
-            log(f"Found release page: {release_url}")
-            break
-            
-    if not release_url: return None
-        
-    # Variant Selection
-    time.sleep(1)
-    soup = get_soup(release_url)
-    if not soup: return None
-    
-    variants = soup.find_all("div", class_="table-row")
-    target_variant_url = None
-    best_score = -999
-    
-    for row in variants:
-        cells = row.find_all("div", class_="table-cell")
-        if len(cells) < 4: continue
-        
-        variant_info = cells[0].get_text().strip().lower()
-        arch_info = cells[1].get_text().strip().lower()
-        dpi_info = cells[3].get_text().strip().lower()
-        
-        link_tag = cells[0].find("a", class_="accent_color")
-        if not link_tag: continue
-        url = base_url + link_tag['href']
-        
-        score = 0
-        if "arm64-v8a" in arch_info: score += 100
-        elif "universal" in arch_info: score += 50
-        elif "x86" in arch_info: score = -1000 
-        else: score = -100
-            
-        if "nodpi" in dpi_info: score += 20
-        if "apk" in variant_info: score += 10
-        elif "bundle" in variant_info: score += 5
-            
-        if score > best_score:
-            best_score = score
-            target_variant_url = url
-            
-    if not target_variant_url:
-        log("No suitable arm64 variant found.")
-        return None
-        
-    log(f"Selected Variant: {target_variant_url}")
-    
-    # Download Link
-    time.sleep(1)
-    soup = get_soup(target_variant_url)
-    if not soup: return None
-    
-    btn = soup.select_one("a.downloadButton")
-    if not btn: return None
-        
-    download_page_url = base_url + btn['href']
-    
-    # Final Page
-    time.sleep(1)
-    soup = get_soup(download_page_url)
-    if not soup: return None
-    
-    here_link = soup.find("a", string=re.compile("here", re.I))
-    final_url = None
-    
-    if here_link:
-        final_url = base_url + here_link['href']
-    else:
-        fallback_link = soup.find("a", href=re.compile(r"download\.php\?id="))
-        if fallback_link:
-            final_url = base_url + fallback_link['href']
-            
-    if not final_url: return None
-        
-    filename = f"downloads/{app_name.replace(' ', '')}-{version}.apk"
-    download_file(final_url, filename)
-    return filename
-
-# --- Bundle Processing (Merging) ---
-
-def process_apk(apk_path, apkeditor_path):
-    """
-    If bundle, MERGES splits into one APK.
-    Returns: Path to single APK file.
-    """
-    if not zipfile.is_zipfile(apk_path):
-        return apk_path # Already a single APK
-    
-    # Check contents
-    is_bundle = False
-    with zipfile.ZipFile(apk_path, 'r') as z:
-        if any(f.endswith('.apk') for f in z.namelist()):
-            is_bundle = True
-            
-    if not is_bundle:
-        return apk_path # Just a regular APK (which is a zip)
-
-    log("Bundle detected. Merging with APKEditor...")
-    
-    # Extract to a temp folder first? No, APKEditor m takes directory
-    extract_dir = "extracted_apk"
-    if os.path.exists(extract_dir):
-        shutil.rmtree(extract_dir)
-    os.makedirs(extract_dir)
-    
-    with zipfile.ZipFile(apk_path, 'r') as z:
-        z.extractall(extract_dir)
-        
-    merged_apk = apk_path.replace(".apk", "_merged.apk")
-    
-    # Command: java -jar APKEditor.jar m -i <input_dir> -o <output.apk>
-    cmd = [
-        "java", "-jar", apkeditor_path,
-        "m", "-i", extract_dir, "-o", merged_apk
-    ]
-    
-    try:
-        subprocess.run(cmd, check=True)
-        log(f"Merge successful: {merged_apk}")
-        return merged_apk
-    except subprocess.CalledProcessError as e:
-        error(f"APK Merge failed: {e}")
-
-# --- Main ---
+    error("Could not determine version automatically. Please verify patches or use manual override.")
 
 def main():
-    package_name = os.environ.get("PACKAGE_NAME")
-    app_name = os.environ.get("APP_NAME")
+    app_name = os.environ.get("APP_NAME") # e.g., "youtube"
+    patch_source = os.environ.get("PATCH_SOURCE") # e.g., "revanced"
     manual_version = os.environ.get("VERSION", "auto")
     
-    if not package_name or not app_name:
-        error("Missing env vars")
-        
-    cli_path, patches_rvp_path, apkeditor_path = fetch_tools()
+    if not app_name or not patch_source:
+        error("Missing required env vars")
+
+    # 1. Fetch Tools
+    cli_path, patches_path = fetch_tools(patch_source)
     
-    target_version = get_compatible_version(package_name, cli_path, patches_rvp_path, manual_version)
-    if not target_version: error("Version detection failed")
-        
+    # 2. Determine Version
+    package_name = PKG_MAP.get(app_name, "")
+    target_version = get_target_version(cli_path, patches_path, package_name, manual_version)
+    
+    # 3. Download APK from Repo
+    # Construct URL: youtube-v19.16.39.apk
+    # Note: Ensure your repo filenames match this pattern strictly!
+    apk_filename = f"{app_name}-v{target_version}.apk"
+    download_url = f"{APK_BASE_URL}/{apk_filename}"
+    
     os.makedirs("downloads", exist_ok=True)
-    raw_apk_path = scrape_apkmirror(app_name, target_version)
-    if not raw_apk_path: error("Download failed")
-        
-    # Process (Merge if needed)
-    final_apk_path = process_apk(raw_apk_path, apkeditor_path)
+    local_apk_path = f"downloads/{apk_filename}"
     
-    # Patch
-    output_apk = f"build/{app_name.replace(' ', '')}-ReVanced-v{target_version}.apk"
+    log(f"Attempting download from: {download_url}")
+    success = download_file(download_url, local_apk_path)
+    
+    if not success:
+        error(f"Failed to download APK from repo. Verify file exists: {apk_filename}")
+        
+    # 4. Patch
+    output_apk = f"build/{app_name}-{patch_source}-v{target_version}.apk"
     os.makedirs("build", exist_ok=True)
     
     cmd = [
         "java", "-jar", cli_path,
         "patch",
-        "-p", patches_rvp_path,
+        "-p", patches_path,
         "-o", output_apk,
-        final_apk_path # Single file argument now!
+        local_apk_path
     ]
     
-    log(f"Running Patcher...")
+    log("Running patcher...")
     try:
         subprocess.run(cmd, check=True)
-        log(f"Success: {output_apk}")
+        log(f"Build Success: {output_apk}")
         with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"PATCHED_APK={output_apk}\n")
             f.write(f"APP_VERSION={target_version}\n")
