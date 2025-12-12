@@ -79,59 +79,70 @@ def check_versions():
             continue
 
         try:
-            # Use --with-versions to get version info
-            cmd = ["java", "-jar", cli_path, "list-patches", "--with-packages", "--with-versions", patches_path]
+            # Command changed to 'list-versions' as requested
+            cmd = ["java", "-jar", cli_path, "list-versions", "-f", patches_path] 
+            # -f flag sometimes needed for formatting, or just patches.rvp
+            # We'll try bare command first: list-versions patches.rvp
+            cmd = ["java", "-jar", cli_path, "list-versions", patches_path]
+            
             output = subprocess.check_output(cmd, text=True)
-            
-            # --- DEBUG: Print first few lines of output to see format ---
-            # print(f"DEBUG OUTPUT FOR {source_name}:")
-            # print(output[:500]) 
-            # ------------------------------------------------------------
-
         except Exception as e:
-            print(f"{source_name:<15} | CLI Error: {e}")
-            continue
+            # Fallback if list-versions fails (older CLIs might not have it)
+            try:
+                cmd = ["java", "-jar", cli_path, "list-patches", "--with-versions", patches_path]
+                output = subprocess.check_output(cmd, text=True)
+            except Exception as e2:
+                print(f"{source_name:<15} | CLI Error: {e2}")
+                continue
 
+        # --- Parsing Logic ---
+        # We need to map Package -> Versions
+        # The output format often groups versions under packages.
+        
+        found_versions = {app: set() for app in APPS_TO_CHECK}
+        current_package = None
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line: continue
+
+            # check if this line is a package name we care about
+            is_package_line = False
+            for app in APPS_TO_CHECK:
+                if app in line:
+                    current_package = app
+                    is_package_line = True
+                    break
+            
+            if is_package_line:
+                continue
+
+            # If we are under a package, look for versions
+            if current_package:
+                # Regex for version: 19.16.39 or v19.16.39
+                # We strip common non-version chars
+                v_match = re.search(r'\b(\d+\.\d+\.\d+)\b', line)
+                if v_match:
+                    found_versions[current_package].add(v_match.group(1))
+                
+                # Stop if we hit a line that looks like a different package or header (heuristic)
+                # But 'list-versions' usually strictly lists them. 
+
+        # Print Results
         for app in APPS_TO_CHECK:
-            versions = set()
-            
-            # Regex strategy:
-            # 1. Look for lines like "com.package.name (v1, v2)"
-            # 2. Look for lines that might be indented under the package
-            
-            # This regex captures versions in parentheses immediately following the package name
-            # e.g. "com.google.android.youtube (19.04.37, 19.05.36)"
-            # It also handles cases with spaces or "v" prefixes
-            
-            # Escape the app package name for regex safety
-            escaped_app = re.escape(app)
-            
-            # Pattern: app_package followed by versions in parentheses
-            pattern = rf"{escaped_app}\s*\((.*?)\)"
-            
-            matches = re.findall(pattern, output)
-            for match in matches:
-                # 'match' is the content inside parens, e.g. "19.04.37, 19.05.36"
-                raw_vs = re.split(r'[,\s]+', match)
-                for v in raw_vs:
-                    clean_v = v.strip()
-                    # Filter for something that looks like a version (digits.digits)
-                    if re.match(r'^\d+(\.\d+)+$', clean_v):
-                        versions.add(clean_v)
-
+            versions = found_versions[app]
             if versions:
-                # Sort by version number logic (not string)
+                # Sort versions
                 def version_sort_key(v):
                     try:
                         return [int(part) for part in v.split('.')]
                     except:
                         return [0]
-
+                
                 sorted_vs = sorted(list(versions), key=version_sort_key, reverse=True)
-                # Show top result (latest)
                 print(f"{source_name:<15} | {app:<40} | {sorted_vs[0]}")
             else:
-                print(f"{source_name:<15} | {app:<40} | Any/Universal (or parsing failed)")
+                print(f"{source_name:<15} | {app:<40} | Any/Universal")
 
 if __name__ == "__main__":
     check_versions()
