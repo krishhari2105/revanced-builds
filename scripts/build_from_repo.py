@@ -114,6 +114,35 @@ def fetch_apkeditor():
              raise Exception("Failed to download APKEditor.jar")
     return apkeditor_path
 
+def parse_version_override(override_string, current_app):
+    """
+    Parses version input.
+    Formats accepted:
+    - "auto" (default)
+    - "19.16.39" (Global override)
+    - "yt-music=7.02.51, youtube=19.16.39" (App-specific)
+    """
+    if not override_string or override_string == "auto":
+        return "auto"
+
+    # Check if it's a map format (contains '=')
+    if "=" in override_string:
+        try:
+            # Parse comma-separated key=value pairs
+            overrides = {}
+            for part in override_string.split(","):
+                key, val = part.split("=")
+                overrides[key.strip()] = val.strip()
+            
+            # Return specific override if exists, else auto
+            return overrides.get(current_app, "auto")
+        except:
+            log(f"Warning: Failed to parse version override string '{override_string}'. Using auto.")
+            return "auto"
+    
+    # It's a single version string, treat as global override
+    return override_string
+
 def get_target_version(cli_path, patches_path, package_name, manual_version):
     if manual_version and manual_version != "auto":
         log(f"Manual version override: {manual_version}")
@@ -151,12 +180,7 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
     raise Exception(f"Could not determine version automatically for {package_name}")
 
 def strip_monolithic_apk(apk_path):
-    """
-    Removes non-arm64 libraries from a monolithic APK to reduce size.
-    """
     log(f"Inspecting monolithic APK: {apk_path}")
-    
-    # Check if it contains multiple architectures
     has_arm64 = False
     has_others = False
     
@@ -168,10 +192,10 @@ def strip_monolithic_apk(apk_path):
                 elif "lib/x86" in name or "lib/armeabi-v7a" in name:
                     has_others = True
     except:
-        return apk_path # Invalid zip, let patcher fail later
+        return apk_path 
 
     if not has_arm64:
-        log("No arm64-v8a libs found or purely Java/Kotlin app. Skipping strip.")
+        log("No arm64-v8a libs found. Skipping strip.")
         return apk_path
         
     if not has_others:
@@ -185,7 +209,6 @@ def strip_monolithic_apk(apk_path):
         with zipfile.ZipFile(stripped_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 name = item.filename
-                # Filter: Keep if NOT lib OR (is lib AND is arm64)
                 if not name.startswith("lib/") or "lib/arm64-v8a/" in name:
                     buffer = zin.read(name)
                     zout.writestr(item, buffer)
@@ -194,9 +217,6 @@ def strip_monolithic_apk(apk_path):
     return stripped_path
 
 def merge_bundle(bundle_path, apkeditor_path):
-    """
-    Extracts bundle and merges ONLY arm64 splits using APKEditor.
-    """
     log(f"Processing bundle for arm64 extraction: {bundle_path}")
     extract_dir = f"extracted_{os.path.basename(bundle_path)}"
     if os.path.exists(extract_dir):
@@ -209,15 +229,9 @@ def merge_bundle(bundle_path, apkeditor_path):
     except zipfile.BadZipFile:
         raise Exception("Downloaded file is not a valid zip/apkm file.")
 
-    # Filter splits inside extracted directory
-    # We delete anything that is architecture specific BUT NOT arm64
-    # Common names: split_config.arm64_v8a.apk, split_config.armeabi_v7a.apk
-    
     for root, dirs, files in os.walk(extract_dir):
         for f in files:
             if not f.endswith(".apk"): continue
-            
-            # Logic: If it specifies an arch, it MUST be arm64
             if "x86" in f or "armeabi" in f or "mips" in f:
                 if "arm64" not in f:
                     log(f"Removing unwanted split: {f}")
@@ -237,7 +251,7 @@ def merge_bundle(bundle_path, apkeditor_path):
     try:
         subprocess.run(cmd, check=True)
         log("Merge successful.")
-        shutil.rmtree(extract_dir) # cleanup
+        shutil.rmtree(extract_dir) 
         return output_merged
     except subprocess.CalledProcessError as e:
         raise Exception(f"Failed to merge APK bundle: {e}")
@@ -250,21 +264,22 @@ def find_apk_in_release(app_name, version):
     target_base = f"{app_name}-v{version}"
     for asset in release.get('assets', []):
         name = asset['name']
-        # Strict match on start
         if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
             return asset['browser_download_url'], name
     return None, None
 
-def patch_app(app_key, patch_source, version_override, cli_path, patches_path):
+def patch_app(app_key, patch_source, input_version_string, cli_path, patches_path):
     pkg = PKG_MAP.get(app_key)
     if not pkg: 
         log(f"Skipping {app_key}: Unknown package map")
         return False
 
     try:
-        version = get_target_version(cli_path, patches_path, pkg, version_override)
+        # Resolve specific version for this app from the input string
+        app_version_setting = parse_version_override(input_version_string, app_key)
         
-        # Download
+        version = get_target_version(cli_path, patches_path, pkg, app_version_setting)
+        
         dl_url, apk_filename = find_apk_in_release(app_key, version)
         if not dl_url:
             log(f"SKIP: APK {app_key}-v{version} not found in storage repo.")
@@ -275,17 +290,13 @@ def patch_app(app_key, patch_source, version_override, cli_path, patches_path):
         if not download_file(dl_url, local_apk):
              raise Exception("Download failed")
 
-        # Process Input (Bundle Merge OR Monolithic Strip)
         final_apk_path = local_apk
-        
         if local_apk.endswith((".apkm", ".apks", ".xapk")):
             apkeditor_path = fetch_apkeditor()
             final_apk_path = merge_bundle(local_apk, apkeditor_path)
         else:
-            # It's a standard APK, try to strip it
             final_apk_path = strip_monolithic_apk(local_apk)
 
-        # Patch
         dist_dir = "dist"
         os.makedirs(dist_dir, exist_ok=True)
         out_apk = f"{dist_dir}/{app_key}-{patch_source}-v{version}-arm64.apk"
@@ -310,7 +321,7 @@ def patch_app(app_key, patch_source, version_override, cli_path, patches_path):
 def main():
     patch_source = os.environ.get("PATCH_SOURCE")
     apps_input = os.environ.get("APPS_LIST", "all")
-    manual_version = os.environ.get("VERSION", "auto")
+    manual_version_input = os.environ.get("VERSION", "auto")
 
     if not patch_source: 
         print("[!] PATCH_SOURCE env var missing")
@@ -333,7 +344,7 @@ def main():
     for app in apps_to_process:
         print("\n" + "="*40)
         log(f"Starting {app}...")
-        if patch_app(app, patch_source, manual_version, cli_path, patches_path):
+        if patch_app(app, patch_source, manual_version_input, cli_path, patches_path):
             success_count += 1
             
     print("\n" + "="*40)
