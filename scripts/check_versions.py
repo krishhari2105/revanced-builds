@@ -1,5 +1,6 @@
 import os
 import requests
+import re
 import subprocess
 import sys
 
@@ -45,6 +46,7 @@ def download_asset(repo, extension, output_dir):
             
         for asset in resp['assets']:
             if asset['name'].endswith(extension) and "source" not in asset['name']:
+                # Prefer 'all.jar' for CLI
                 if extension == ".jar" and "all" not in asset['name'] and any("all" in a['name'] for a in resp['assets']):
                     continue
                 
@@ -81,58 +83,70 @@ def check_versions():
             cmd = ["java", "-jar", cli_path, "list-versions", patches_path]
             process = subprocess.run(cmd, capture_output=True, text=True)
             
-            if process.returncode != 0:
-                print(f"{source_name:<12} | CLI Error (Code {process.returncode})")
-                print(process.stderr)
-                continue
-
             output = process.stdout
             
-            # --- Strict Parsing Logic ---
+            # --- Parsing Logic for 'list-versions' output ---
             found_versions = {}
             current_pkg = None
 
+            # Example Output Block:
+            # Package name: com.google.android.youtube
+            # Most common compatible versions:
+            #         19.04.37 (56 patches)
+            #         19.03.35 (56 patches)
+            
             for line in output.splitlines():
-                if not line.strip(): continue
+                line = line.strip()
+                if not line: continue
 
-                # Package lines usually start with NO whitespace
-                if not line.startswith(" ") and not line.startswith("\t"):
-                    current_pkg = line.strip()
+                # Detect Package Header
+                if line.startswith("Package name:"):
+                    current_pkg = line.split(":", 1)[1].strip()
                     continue
                 
-                # Version lines are indented
-                if current_pkg and (line.startswith(" ") or line.startswith("\t")):
-                    v = line.strip()
-                    # Filter out non-version strings (sometimes output has other info)
-                    # We assume a version contains at least one dot and starts with a digit or 'v'
-                    if "." in v and (v[0].isdigit() or v.startswith('v')):
+                # If inside a target package block, parse versions
+                if current_pkg in APPS_TO_CHECK:
+                    # Ignore the header "Most common compatible versions:"
+                    if "compatible versions" in line:
+                        continue
+                        
+                    # Parse version line: "19.04.37 (56 patches)" -> "19.04.37"
+                    # Or just "Any"
+                    
+                    # Regex to grab the version part at start of line
+                    # Matches: 19.04.37 OR v19.04.37
+                    v_match = re.match(r'^(v?\d+(\.\d+)+)', line)
+                    
+                    if v_match:
+                        v = v_match.group(1)
+                        if current_pkg not in found_versions:
+                            found_versions[current_pkg] = []
+                        found_versions[current_pkg].append(v)
+                    elif "Any" in line:
                          if current_pkg not in found_versions:
                              found_versions[current_pkg] = []
-                         found_versions[current_pkg].append(v)
+                         found_versions[current_pkg].append("Any")
 
             # --- Display Results ---
             for app in APPS_TO_CHECK:
-                if app in found_versions:
-                    # Sort versions desc (assuming standard semantic versioning)
+                if app in found_versions and found_versions[app]:
                     vs = found_versions[app]
-                    # Cleanup 'v' for sorting
-                    def sort_key(s):
-                        try:
-                            return [int(x) for x in s.lstrip('v').split('.')]
-                        except:
-                            return [0]
                     
-                    vs.sort(key=sort_key, reverse=True)
-                    latest = vs[0]
-                    print(f"{source_name:<12} | {app:<40} | {latest}")
+                    if "Any" in vs:
+                         print(f"{source_name:<12} | {app:<40} | Any")
+                    else:
+                        # Sort versions desc
+                        def sort_key(s):
+                            try:
+                                return [int(x) for x in s.lstrip('v').split('.')]
+                            except:
+                                return [0]
+                        
+                        vs.sort(key=sort_key, reverse=True)
+                        latest = vs[0]
+                        print(f"{source_name:<12} | {app:<40} | {latest}")
                 else:
                     print(f"{source_name:<12} | {app:<40} | None (Not in patches)")
-            
-            # Debug dump if YouTube wasn't found (implies parsing failure or format change)
-            if "com.google.android.youtube" not in found_versions:
-                print(f"\n[DEBUG] Raw Output for {source_name} (First 20 lines):")
-                print("\n".join(output.splitlines()[:20]))
-                print("-" * 20 + "\n")
 
         except Exception as e:
             print(f"{source_name:<12} | Exception: {e}")
