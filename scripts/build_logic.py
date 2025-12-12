@@ -9,7 +9,6 @@ import shutil
 # --- Configuration ---
 APK_REPO_OWNER = "krishhari2105"
 APK_REPO_NAME = "base-apks"
-APK_BASE_URL = f"https://raw.githubusercontent.com/{APK_REPO_OWNER}/{APK_REPO_NAME}/main/apps"
 
 SOURCES = {
     "revanced": {
@@ -61,25 +60,39 @@ def download_file(url, filename):
         log(f"Download failed: {e}")
         return False
 
+def get_latest_github_release(repo):
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        resp = requests.get(url).json()
+        return resp
+    except Exception as e:
+        log(f"Failed to fetch release for {repo}: {e}")
+        return None
+
 def fetch_tools(source_key):
     config = SOURCES.get(source_key)
     os.makedirs("tools", exist_ok=True)
     
     def get_asset(repo, ext):
-        url = f"https://api.github.com/repos/{repo}/releases/latest"
-        resp = requests.get(url).json()
-        for asset in resp['assets']:
+        release = get_latest_github_release(repo)
+        if not release: return None, None
+        
+        for asset in release.get('assets', []):
             if asset['name'].endswith(ext) and "source" not in asset['name']:
-                if ext == ".jar" and "all" not in asset['name'] and any("all" in a['name'] for a in resp['assets']):
+                if ext == ".jar" and "all" not in asset['name'] and any("all" in a['name'] for a in release['assets']):
                     continue
                 return asset['browser_download_url'], asset['name']
         return None, None
 
     cli_url, cli_name = get_asset(config['cli_repo'], config['cli_asset'])
+    if not cli_url: error(f"Could not find CLI for {source_key}")
+    
     cli_path = f"tools/{cli_name}"
     if not os.path.exists(cli_path): download_file(cli_url, cli_path)
     
     patches_url, patches_name = get_asset(config['patches_repo'], config['patches_asset'])
+    if not patches_url: error(f"Could not find Patches for {source_key}")
+    
     patches_path = f"tools/{patches_name}"
     if not os.path.exists(patches_path): download_file(patches_url, patches_path)
     
@@ -90,7 +103,6 @@ def fetch_apkeditor():
     os.makedirs("tools", exist_ok=True)
     apkeditor_path = "tools/APKEditor.jar"
     if not os.path.exists(apkeditor_path):
-        # Using a known reliable release of APKEditor (v1.4.0 is stable for merging)
         url = "https://github.com/REAndroid/APKEditor/releases/download/V1.4.0/APKEditor-1.4.0.jar"
         if not download_file(url, apkeditor_path):
              error("Failed to download APKEditor.jar")
@@ -119,7 +131,7 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
                 continue
                 
             if current_pkg == package_name:
-                 # Version match
+                 # Version match: "19.16.39 (50 patches)" or just "19.16.39"
                  v_match = re.match(r'^(v?\d+(\.\d+)+)', line)
                  if v_match:
                      versions.append(v_match.group(1))
@@ -136,30 +148,24 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
     error("Could not determine version automatically.")
 
 def merge_bundle(bundle_path, apkeditor_path):
-    """
-    Extracts a bundle (zip/apkm/apks) and merges it into a single APK.
-    """
     log(f"Processing bundle: {bundle_path}")
     extract_dir = "extracted_bundle"
     if os.path.exists(extract_dir):
         shutil.rmtree(extract_dir)
     os.makedirs(extract_dir)
     
-    # 1. Extract
     try:
         with zipfile.ZipFile(bundle_path, 'r') as z:
             z.extractall(extract_dir)
     except zipfile.BadZipFile:
         error("Downloaded file is not a valid zip/apkm file.")
 
-    # 2. Merge
     output_merged = bundle_path.replace(".apkm", ".apk").replace(".apks", ".apk").replace(".xapk", ".apk")
     if output_merged == bundle_path:
         output_merged = bundle_path + "_merged.apk"
 
     log(f"Merging splits into: {output_merged}")
     
-    # Command: java -jar APKEditor.jar m -i <dir> -o <out.apk>
     cmd = [
         "java", "-jar", apkeditor_path,
         "m", "-i", extract_dir, "-o", output_merged
@@ -171,6 +177,29 @@ def merge_bundle(bundle_path, apkeditor_path):
         return output_merged
     except subprocess.CalledProcessError as e:
         error(f"Failed to merge APK bundle: {e}")
+
+def find_apk_in_release(app_name, version):
+    """
+    Searches Release Assets of APK_REPO for a file matching appname-vVersion
+    """
+    log(f"Searching release assets in {APK_REPO_OWNER}/{APK_REPO_NAME} for {app_name} v{version}...")
+    release = get_latest_github_release(f"{APK_REPO_OWNER}/{APK_REPO_NAME}")
+    
+    if not release:
+        error("Could not fetch releases from APK repo.")
+
+    # Patterns to match
+    # 1. Exact: youtube-v19.16.39.apk
+    # 2. Bundle: youtube-v19.16.39.apkm (or .apks, .xapk)
+    
+    target_base = f"{app_name}-v{version}"
+    
+    for asset in release.get('assets', []):
+        name = asset['name']
+        if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
+            return asset['browser_download_url'], name
+            
+    return None, None
 
 def main():
     app_name = os.environ.get("APP_NAME")
@@ -186,31 +215,23 @@ def main():
     pkg = PKG_MAP.get(app_name)
     version = get_target_version(cli_path, patches_path, pkg, manual_version)
     
-    # 3. Download APK or Bundle
-    # We try extensions in order: .apk -> .apkm -> .apks -> .xapk
-    extensions = [".apk", ".apkm", ".apks", ".xapk"]
-    downloaded_path = None
+    # 3. Download APK from Release Assets
+    dl_url, apk_filename = find_apk_in_release(app_name, version)
+    
+    if not dl_url:
+        error(f"APK not found in {APK_REPO_NAME} releases for {app_name} v{version}. Please upload '{app_name}-v{version}.apk/apkm' to releases.")
     
     os.makedirs("downloads", exist_ok=True)
+    local_apk = f"downloads/{apk_filename}"
     
-    for ext in extensions:
-        apk_file = f"{app_name}-v{version}{ext}"
-        dl_url = f"{APK_BASE_URL}/{apk_file}"
-        local_path = f"downloads/{apk_file}"
-        
-        log(f"Checking for {ext} file: {dl_url}")
-        if download_file(dl_url, local_path):
-            downloaded_path = local_path
-            break
-            
-    if not downloaded_path:
-        error(f"Could not download APK/Bundle for {app_name} v{version}. Checked extensions: {extensions}")
+    if not download_file(dl_url, local_apk):
+        error("Download failed.")
 
     # 4. Handle Bundle if needed
-    final_apk_path = downloaded_path
-    if downloaded_path.endswith((".apkm", ".apks", ".xapk")):
+    final_apk_path = local_apk
+    if local_apk.endswith((".apkm", ".apks", ".xapk")):
         apkeditor_path = fetch_apkeditor()
-        final_apk_path = merge_bundle(downloaded_path, apkeditor_path)
+        final_apk_path = merge_bundle(local_apk, apkeditor_path)
 
     # 5. Patch
     out_apk = f"build/{app_name}-{patch_source}-v{version}.apk"
