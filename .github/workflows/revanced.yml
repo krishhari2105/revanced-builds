@@ -12,6 +12,7 @@ on:
           - revanced
           - inotia00
           - anddea
+          - lisouseinaikyrios
       apps_list:
         description: "Apps to patch (comma-separated or 'all')"
         required: true
