@@ -23,6 +23,12 @@ SOURCES = {
         "cli_repo": "inotia00/revanced-cli", 
         "patches_asset": ".rvp",
         "cli_asset": ".jar"
+    },
+    "lisouseinaikyrios": {
+        "patches_repo": "LisoUseInAIKyrios/revanced-patches",
+        "cli_repo": "LisoUseInAIKyrios/revanced-cli",
+        "patches_asset": ".rvp",
+        "cli_asset": ".jar"
     }
 }
 
