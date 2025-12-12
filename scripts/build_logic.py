@@ -3,6 +3,8 @@ import requests
 import re
 import subprocess
 import sys
+import zipfile
+import shutil
 
 # --- Configuration ---
 APK_REPO_OWNER = "krishhari2105"
@@ -83,6 +85,17 @@ def fetch_tools(source_key):
     
     return cli_path, patches_path
 
+def fetch_apkeditor():
+    """Downloads APKEditor for merging split APKs."""
+    os.makedirs("tools", exist_ok=True)
+    apkeditor_path = "tools/APKEditor.jar"
+    if not os.path.exists(apkeditor_path):
+        # Using a known reliable release of APKEditor (v1.4.0 is stable for merging)
+        url = "https://github.com/REAndroid/APKEditor/releases/download/V1.4.0/APKEditor-1.4.0.jar"
+        if not download_file(url, apkeditor_path):
+             error("Failed to download APKEditor.jar")
+    return apkeditor_path
+
 def get_target_version(cli_path, patches_path, package_name, manual_version):
     if manual_version and manual_version != "auto":
         log(f"Manual version override: {manual_version}")
@@ -122,6 +135,43 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
         
     error("Could not determine version automatically.")
 
+def merge_bundle(bundle_path, apkeditor_path):
+    """
+    Extracts a bundle (zip/apkm/apks) and merges it into a single APK.
+    """
+    log(f"Processing bundle: {bundle_path}")
+    extract_dir = "extracted_bundle"
+    if os.path.exists(extract_dir):
+        shutil.rmtree(extract_dir)
+    os.makedirs(extract_dir)
+    
+    # 1. Extract
+    try:
+        with zipfile.ZipFile(bundle_path, 'r') as z:
+            z.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        error("Downloaded file is not a valid zip/apkm file.")
+
+    # 2. Merge
+    output_merged = bundle_path.replace(".apkm", ".apk").replace(".apks", ".apk").replace(".xapk", ".apk")
+    if output_merged == bundle_path:
+        output_merged = bundle_path + "_merged.apk"
+
+    log(f"Merging splits into: {output_merged}")
+    
+    # Command: java -jar APKEditor.jar m -i <dir> -o <out.apk>
+    cmd = [
+        "java", "-jar", apkeditor_path,
+        "m", "-i", extract_dir, "-o", output_merged
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+        log("Merge successful.")
+        return output_merged
+    except subprocess.CalledProcessError as e:
+        error(f"Failed to merge APK bundle: {e}")
+
 def main():
     app_name = os.environ.get("APP_NAME")
     patch_source = os.environ.get("PATCH_SOURCE")
@@ -136,19 +186,33 @@ def main():
     pkg = PKG_MAP.get(app_name)
     version = get_target_version(cli_path, patches_path, pkg, manual_version)
     
-    # 3. Download APK
-    # Format: youtube-v19.16.39.apk
-    apk_file = f"{app_name}-v{version}.apk"
-    dl_url = f"{APK_BASE_URL}/{apk_file}"
+    # 3. Download APK or Bundle
+    # We try extensions in order: .apk -> .apkm -> .apks -> .xapk
+    extensions = [".apk", ".apkm", ".apks", ".xapk"]
+    downloaded_path = None
     
     os.makedirs("downloads", exist_ok=True)
-    local_apk = f"downloads/{apk_file}"
     
-    log(f"Downloading APK from: {dl_url}")
-    if not download_file(dl_url, local_apk):
-        error(f"APK download failed. Ensure {apk_file} exists in your repo.")
+    for ext in extensions:
+        apk_file = f"{app_name}-v{version}{ext}"
+        dl_url = f"{APK_BASE_URL}/{apk_file}"
+        local_path = f"downloads/{apk_file}"
         
-    # 4. Patch
+        log(f"Checking for {ext} file: {dl_url}")
+        if download_file(dl_url, local_path):
+            downloaded_path = local_path
+            break
+            
+    if not downloaded_path:
+        error(f"Could not download APK/Bundle for {app_name} v{version}. Checked extensions: {extensions}")
+
+    # 4. Handle Bundle if needed
+    final_apk_path = downloaded_path
+    if downloaded_path.endswith((".apkm", ".apks", ".xapk")):
+        apkeditor_path = fetch_apkeditor()
+        final_apk_path = merge_bundle(downloaded_path, apkeditor_path)
+
+    # 5. Patch
     out_apk = f"build/{app_name}-{patch_source}-v{version}.apk"
     os.makedirs("build", exist_ok=True)
     
@@ -157,7 +221,7 @@ def main():
         "patch",
         "-p", patches_path,
         "-o", out_apk,
-        local_apk
+        final_apk_path
     ]
     
     log("Running patcher...")
