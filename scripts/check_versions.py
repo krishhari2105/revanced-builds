@@ -46,7 +46,7 @@ def download_asset(repo, extension, output_dir):
             
         for asset in resp['assets']:
             if asset['name'].endswith(extension) and "source" not in asset['name']:
-                # Prefer 'all.jar' for CLI
+                # Prefer 'all.jar' for CLI to avoid dependency issues
                 if extension == ".jar" and "all" not in asset['name'] and any("all" in a['name'] for a in resp['assets']):
                     continue
                 
@@ -85,36 +85,27 @@ def check_versions():
             
             output = process.stdout
             
-            # --- Parsing Logic for 'list-versions' output ---
+            # --- Parsing Logic ---
             found_versions = {}
             current_pkg = None
 
-            # Example Output Block:
-            # Package name: com.google.android.youtube
-            # Most common compatible versions:
-            #         19.04.37 (56 patches)
-            #         19.03.35 (56 patches)
-            
             for line in output.splitlines():
                 line = line.strip()
                 if not line: continue
 
-                # Detect Package Header
-                if line.startswith("Package name:"):
-                    current_pkg = line.split(":", 1)[1].strip()
+                # Match "Package name: com.package.name" ignoring prefix like "INFO: "
+                # This fixes the issue where the first line wasn't detected
+                pkg_match = re.search(r"Package name:\s*([a-zA-Z0-9_.]+)", line)
+                if pkg_match:
+                    current_pkg = pkg_match.group(1)
                     continue
-                
-                # If inside a target package block, parse versions
+
                 if current_pkg in APPS_TO_CHECK:
-                    # Ignore the header "Most common compatible versions:"
-                    if "compatible versions" in line:
-                        continue
-                        
-                    # Parse version line: "19.04.37 (56 patches)" -> "19.04.37"
-                    # Or just "Any"
+                    # Ignore headers
+                    if "compatible versions" in line: continue
                     
-                    # Regex to grab the version part at start of line
-                    # Matches: 19.04.37 OR v19.04.37
+                    # Match version numbers at start of line
+                    # Matches: 19.16.39 OR v19.16.39
                     v_match = re.match(r'^(v?\d+(\.\d+)+)', line)
                     
                     if v_match:
@@ -131,7 +122,6 @@ def check_versions():
             for app in APPS_TO_CHECK:
                 if app in found_versions and found_versions[app]:
                     vs = found_versions[app]
-                    
                     if "Any" in vs:
                          print(f"{source_name:<12} | {app:<40} | Any")
                     else:
