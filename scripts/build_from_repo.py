@@ -211,41 +211,12 @@ def get_target_versions(cli_path, patches_path, package_name, manual_version):
     raise Exception(f"Could not determine version automatically for {package_name}")
 
 def strip_monolithic_apk(apk_path):
-    log(f"Inspecting monolithic APK: {apk_path}")
-    has_arm64 = False
-    has_others = False
-    
-    try:
-        with zipfile.ZipFile(apk_path, 'r') as z:
-            for name in z.namelist():
-                if "lib/arm64-v8a" in name:
-                    has_arm64 = True
-                elif "lib/x86" in name or "lib/armeabi-v7a" in name:
-                    has_others = True
-    except:
-        return apk_path 
-
-    if not has_arm64:
-        log("No arm64-v8a libs found. Skipping strip.")
-        return apk_path
-        
-    if not has_others:
-        log("APK is already arm64-only. Skipping strip.")
-        return apk_path
-
-    log("Stripping non-arm64 architectures...")
-    stripped_path = apk_path.replace(".apk", "_arm64.apk")
-    
-    with zipfile.ZipFile(apk_path, 'r') as zin:
-        with zipfile.ZipFile(stripped_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                name = item.filename
-                if not name.startswith("lib/") or "lib/arm64-v8a/" in name:
-                    buffer = zin.read(name)
-                    zout.writestr(item, buffer)
-                    
-    log(f"Stripped APK created: {stripped_path}")
-    return stripped_path
+    """
+    MODIFIED: PASSTHROUGH
+    Returns the APK path without modification to prevent resource corruption.
+    """
+    log(f"Using original APK (skipping strip to prevent corruption): {apk_path}")
+    return apk_path
 
 def merge_bundle(bundle_path, apkeditor_path):
     log(f"Processing bundle for arm64 extraction: {bundle_path}")
