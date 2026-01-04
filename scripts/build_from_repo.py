@@ -57,39 +57,31 @@ def get_auth_headers():
     token = os.environ.get("PRIVATE_REPO_TOKEN")
     if token:
         return {"Authorization": f"token {token}", "User-Agent": "Mozilla/5.0"}
-    return {"User-Agent": "Mozilla/5.0"} # Fallback for public
+    return {"User-Agent": "Mozilla/5.0"}
 
 def download_file(url, filename):
     log(f"Downloading {url} -> {filename}")
     try:
         headers = get_auth_headers()
-        # Essential for downloading binary files from the API
         headers["Accept"] = "application/octet-stream"
         
-        # 1. Start the request but DO NOT follow redirects immediately
         with requests.get(url, headers=headers, stream=True, allow_redirects=False) as r:
             if r.status_code == 404: 
                 log(f"Error: 404 Not Found for {url}")
                 return False
             
-            # 2. Handle Redirects Manually
-            # If we get a 302/301, we must download from the NEW location
-            # BUT we must drop the 'Authorization' header for the new location (S3)
             final_url = url
             if r.status_code in (301, 302, 307, 308):
                 final_url = r.headers['Location']
-                # Remove auth header for the S3 link
                 if "Authorization" in headers:
                     del headers["Authorization"]
                 
-                # Make the second request to the actual file location
                 with requests.get(final_url, headers=headers, stream=True) as r2:
                     r2.raise_for_status()
                     with open(filename, 'wb') as f:
                         for chunk in r2.iter_content(chunk_size=8192):
                             f.write(chunk)
             else:
-                # If no redirect, just write the content (unlikely for assets, but safe fallback)
                 r.raise_for_status()
                 with open(filename, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -100,14 +92,12 @@ def download_file(url, filename):
         log(f"Download failed: {e}")
         return False
 
-
-
 def get_latest_github_release(repo):
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         resp = requests.get(url, headers=get_auth_headers())
-        resp.raise_for_status()  # Check for HTTP errors (404, 500, etc.)
-        return resp.json()       # <--- RETURN THE JSON DICTIONARY
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         log(f"Failed to fetch release for {repo}: {e}")
         return None
@@ -144,6 +134,7 @@ def fetch_tools(source_key):
 def fetch_apkeditor():
     os.makedirs("tools", exist_ok=True)
     apkeditor_path = "tools/APKEditor.jar"
+    # Using v1.4.7 as requested/verified
     if not os.path.exists(apkeditor_path):
         url = "https://github.com/REAndroid/APKEditor/releases/download/V1.4.7/APKEditor-1.4.7.jar"
         if not download_file(url, apkeditor_path):
@@ -164,14 +155,9 @@ def parse_version_override(override_string, current_app):
         except:
             log(f"Warning: Failed to parse version override string '{override_string}'. Using auto.")
             return "auto"
-    
     return override_string
 
 def get_target_versions(cli_path, patches_path, package_name, manual_version):
-    """
-    Returns a LIST of compatible versions, sorted descending.
-    If manual_version is set, returns a list with just that version.
-    """
     if manual_version and manual_version != "auto":
         log(f"Manual version override: {manual_version}")
         return [manual_version]
@@ -193,14 +179,11 @@ def get_target_versions(cli_path, patches_path, package_name, manual_version):
                 continue
                 
             if current_pkg == package_name:
-                 # Match version like 19.16.39 or v19.16.39
-                 # Note: regex must be strict enough not to catch patch counts "(58 patches)"
                  v_match = re.match(r'^(v?\d+(\.\d+)+)', line)
                  if v_match:
                      versions.append(v_match.group(1))
 
         if versions:
-            # Sort desc
             versions.sort(key=lambda s: [int(x) for x in s.lstrip('v').split('.') if x.isdigit()], reverse=True)
             log(f"Detected compatible versions: {versions}")
             return versions
@@ -211,86 +194,41 @@ def get_target_versions(cli_path, patches_path, package_name, manual_version):
     raise Exception(f"Could not determine version automatically for {package_name}")
 
 def strip_monolithic_apk(apk_path):
-    log(f"Inspecting monolithic APK: {apk_path}")
-    has_arm64 = False
-    has_others = False
-    
-    try:
-        with zipfile.ZipFile(apk_path, 'r') as z:
-            for name in z.namelist():
-                if "lib/arm64-v8a" in name:
-                    has_arm64 = True
-                elif "lib/x86" in name or "lib/armeabi-v7a" in name:
-                    has_others = True
-    except:
-        return apk_path 
-
-    if not has_arm64:
-        log("No arm64-v8a libs found. Skipping strip.")
-        return apk_path
-        
-    if not has_others:
-        log("APK is already arm64-only. Skipping strip.")
-        return apk_path
-
-    log("Stripping non-arm64 architectures...")
-    stripped_path = apk_path.replace(".apk", "_arm64.apk")
-    
-    with zipfile.ZipFile(apk_path, 'r') as zin:
-        with zipfile.ZipFile(stripped_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                name = item.filename
-                if not name.startswith("lib/") or "lib/arm64-v8a/" in name:
-                    buffer = zin.read(name)
-                    zout.writestr(item, buffer)
-                    
-    log(f"Stripped APK created: {stripped_path}")
-    return stripped_path
+    """
+    PASSTHROUGH: Returns the APK path without modification.
+    This prevents corruption of resources in newer apps.
+    """
+    log(f"Using original APK (skipping strip to prevent corruption): {apk_path}")
+    return apk_path 
 
 def merge_bundle(bundle_path, apkeditor_path):
-    log(f"Processing bundle for arm64 extraction: {bundle_path}")
-    extract_dir = f"extracted_{os.path.basename(bundle_path)}"
-    if os.path.exists(extract_dir):
-        shutil.rmtree(extract_dir)
-    os.makedirs(extract_dir)
+    """
+    Directly merges the Bundle using APKEditor.
+    Does NOT manually delete files to ensure all language configs are kept.
+    """
+    log(f"Merging bundle directly: {bundle_path}")
     
-    try:
-        with zipfile.ZipFile(bundle_path, 'r') as z:
-            z.extractall(extract_dir)
-    except zipfile.BadZipFile:
-        raise Exception("Downloaded file is not a valid zip/apkm file.")
-
-    for root, dirs, files in os.walk(extract_dir):
-        for f in files:
-            if not f.endswith(".apk"): continue
-            if "x86" in f or "armeabi" in f or "mips" in f:
-                if "arm64" not in f:
-                    log(f"Removing unwanted split: {f}")
-                    os.remove(os.path.join(root, f))
-    
-    output_merged = bundle_path.replace(".apkm", "_arm64.apk").replace(".apks", "_arm64.apk").replace(".xapk", "_arm64.apk")
+    # Create output filename
+    output_merged = bundle_path.replace(".apkm", "_merged.apk").replace(".apks", "_merged.apk").replace(".xapk", "_merged.apk")
     if output_merged == bundle_path:
-        output_merged = bundle_path + "_merged_arm64.apk"
+        output_merged = bundle_path + "_merged.apk"
 
-    log(f"Merging filtered splits into: {output_merged}")
-    
+    # Command: java -jar APKEditor.jar m -i input.apkm -o output.apk
     cmd = [
         "java", "-jar", apkeditor_path,
-        "m", "-i", extract_dir, "-o", output_merged
+        "m", 
+        "-i", bundle_path, 
+        "-o", output_merged
     ]
     
     try:
         subprocess.run(cmd, check=True)
-        log("Merge successful.")
-        shutil.rmtree(extract_dir) 
+        log(f"Merge successful: {output_merged}")
         return output_merged
     except subprocess.CalledProcessError as e:
-        raise Exception(f"Failed to merge APK bundle: {e}")
+        raise Exception(f"APKEditor failed to merge bundle: {e}")
 
 def find_apk_in_release(app_name, version):
-    """
-    Returns (download_url, filename) if found, else (None, None).
-    """
     log(f"Searching release assets for {app_name} v{version}...")
     release = get_latest_github_release(f"{APK_REPO_OWNER}/{APK_REPO_NAME}")
     if not release: raise Exception("Could not fetch APK repo releases.")
@@ -298,10 +236,7 @@ def find_apk_in_release(app_name, version):
     target_base = f"{app_name}-v{version}"
     for asset in release.get('assets', []):
         name = asset['name']
-        # Match 'appname-v19.16.39.apk' or 'appname-v19.16.39.apkm'
-        # Strict prefix check to avoid matching 19.16.391 etc if that ever happens
         if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
-            # Ensure precise version matching if needed, but prefix is usually safe
             return asset['url'], name
     return None, None
 
@@ -313,15 +248,12 @@ def patch_app(app_key, patch_source, input_version_string, cli_path, patches_pat
 
     try:
         app_version_setting = parse_version_override(input_version_string, app_key)
-        
-        # Get LIST of candidate versions
         candidate_versions = get_target_versions(cli_path, patches_path, pkg, app_version_setting)
         
         dl_url = None
         apk_filename = None
         selected_version = None
 
-        # Fallback Logic: Check candidates one by one in release assets
         for ver in candidate_versions:
             url, name = find_apk_in_release(app_key, ver)
             if url:
@@ -343,6 +275,9 @@ def patch_app(app_key, patch_source, input_version_string, cli_path, patches_pat
              raise Exception("Download failed")
 
         final_apk_path = local_apk
+        
+        # LOGIC CHANGE: Only use APKEditor if it is a Bundle.
+        # If it is a standard APK, we use it directly (via strip_monolithic_apk passthrough).
         if local_apk.endswith((".apkm", ".apks", ".xapk")):
             apkeditor_path = fetch_apkeditor()
             final_apk_path = merge_bundle(local_apk, apkeditor_path)
