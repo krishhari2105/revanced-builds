@@ -24,10 +24,10 @@ SOURCES = {
         "patches_asset": ".rvp",
         "cli_asset": ".jar"
     },
-    "lisouseinaikyrios": {
-        "patches_repo": "LisoUseInAIKyrios/revanced-patches",
-        "cli_repo": "LisoUseInAIKyrios/revanced-cli",
-        "patches_asset": ".rvp",
+    "morphe": {
+        "patches_repo": "MorpheApp/morphe-patches",
+        "cli_repo": "MorpheApp/morphe-cli",
+        "patches_asset": ".mpp",
         "cli_asset": ".jar"
     }
 }
