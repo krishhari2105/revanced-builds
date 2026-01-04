@@ -32,7 +32,7 @@ SOURCES = {
     },
     "morphe": {
         "patches_repo": "MorpheApp/morphe-patches",
-        "cli_repo": "orpheApp/morphe-cli",
+        "cli_repo": "MorpheApp/morphe-cli",
         "patches_asset": ".mpp",
         "cli_asset": ".jar"
     }
